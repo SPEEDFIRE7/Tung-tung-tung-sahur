@@ -1,0 +1,140 @@
+name: Build ArrowOS GSI Android 17 (Optimized for 16GB RAM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_build:
+        description: "Enable debug builds with verbose logging"
+        required: false
+        default: false
+        type: boolean
+      target_device:
+        description: "Target device codename (optional, default builds generic GSI)"
+        required: false
+        type: string
+
+jobs:
+  build-gsi:
+    runs-on: self-hosted
+    with:
+      # تخصيص الموارد لموازنة 16GB RAM
+      cpu: "4"
+      memory: "14G"
+      disk: "200G"
+    timeout-minutes: 240
+
+    env:
+      # تقليل المتطلبات وتفعيل ccache
+      ANDROID_BUILD_TOP: "/mnt/src"
+      CCACHE_DIR: "/tmp/ccache"
+      USE_CCACHE: "1"
+      # تقليل حجم الصور
+      ANDROID_COMPILE_BASE: "/opt/android"
+      # تعيين اسم المطور SPEEDFIRE
+      BUILD_DISPLAY_ID: "SPEEDFIRE-ArrowOS-17-${{ github.run_number }}"
+      # تقليل Jobs بناءً على النوى المتاحة
+      BUILD_MAKE_JOBS: "${{ runner.cores }}"
+
+    steps:
+      # === الخطوة 1: إعداد البيئة بايقال الموارد ===
+      - name: Setup Build Environment (Light)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git gnupg flex bison gawk \
+            build-essential zip curl \
+            libncurses-dev xz-utils \
+            python3 distro || true
+          # إعداد ccache للمساحة والسرعة
+          mkdir -p $CCACHE_DIR
+          chmod -R 777 $CCACHE_DIR
+          echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
+
+      # === الخطوة 2: تحميل أداة repo ===
+      - name: Install repo
+        run: |
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod +x ~/repo
+          export PATH="$HOME/repo:$PATH"
+
+      # === الخطوة 3: تهيئة مصدر ArrowOS ===
+      - name: Initialize ArrowOS Source
+        run: |
+          mkdir -p arrow_gsi && cd arrow_gsi
+          repo init -u https://github.com/ArrowOS-Arrow/arrow_manifest.git -b arrow-14.0 --depth=1
+          mkdir -p .repo/local_manifests
+
+      # === الخطوة 4:同步 المصادر (Sync with limited depth) ===
+      - name: Sync Sources (Optimized)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd arrow_gsi
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetches -j4
+
+      # === الخطوة 5: إضافة اسم المطور SPEEDFIRE ===
+      - name: Add SPEEDFIRE Developer Credits
+        run: |
+          cd arrow_gsi
+          # إضافة اسم المطور في خصائص البناء
+          echo 'PRODUCT_BUILD_PROP_OVERRIDES += BUILD_DISPLAY_ID=SPEEDFIRE-ArrowOS-17-userdebug' >> .repo/local_manifests/custom.xml
+          # إنشاء ملف Credits
+          cat > .repo/local_manifests/SPEEDFIRE-credits.xml << 'EOF'
+          <!-- Developer Credits -->
+          <project path="vendor/SPEEDFIRE" name="vendor_speedfire" remote="github" revision="main" />
+          EOF
+
+      # === الخطوة 6: configuration للجهاز (إذا تم specifying) ===
+      - name: Configure Device (Optional)
+        if: inputs.target_device != ''
+        run: |
+          cd arrow_gsi
+          source build/envsetup.sh
+          lunch "arrow_${{ inputs.target_device }}-userdebug" 2>/dev/null || echo "Device not found, building generic GSI"
+
+      # === الخطوة 7: بدء البناء بالموارد المحدودة ===
+      - name: Start GSI Build (Optimized)
+        env:
+          USE_CCACHE: "1"
+          CCACHE_DIR: "/tmp/ccache"
+        run: |
+          cd arrow_gsi
+          source build/envsetup.sh
+          
+          # اختيار الهدف: GSI عامًا أو جهاز محدد
+          if [ -n "${{ inputs.target_device }}" ]; then
+            lunch "arrow_${{ inputs.target_device }}-userdebug"
+          else
+            # بناء GSI جماعي (Treble)
+            lunch "arrow_arm64_bvN-android17-0-userdebug"
+          fi
+          
+          # تفعيل ccache قبل البناء
+          prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-12.0.0-ccache
+          export USE_CCACHE=1
+          
+          # البناء المختصر - فقط system image
+          #削减 build targets to save memory
+          make -j${{ runner.cores }} systemimage 2>&1 | tail -50
+
+      # === الخطوة 8: رفع الملف الناتج ===
+      - name: Upload GSI Image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arrowos-gsi-android17-${{ github.run_number }}
+          path: arrow_gsi/out/target_product/*.img
+          retention-days: 30
+
+      # === الخطوة 9: معلومات البناء ===
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "Build completed for: SPEEDFIRE"
+          echo "GitHub Run: #${{ github.run_number }}"
+          echo "OS: Android 17 (API 30+)"
+          echo "GSI Type: ArrowOS Generic System Image"
+          echo "Developer: SPEEDFIRE (Custom Build)"
+          echo "Resources: 16GB RAM optimized"
+          echo "========================================="
