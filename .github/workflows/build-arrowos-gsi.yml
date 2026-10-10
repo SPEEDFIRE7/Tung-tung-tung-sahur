@@ -16,27 +16,58 @@ on:
 jobs:
   build-gsi:
     runs-on: self-hosted
-    with:
-      # تخصيص الموارد لموازنة 16GB RAM
-      cpu: "4"
-      memory: "14G"
-      disk: "200G"
+    # إزالة 'with:' من هنا لتركيب صحيح، والإعدادات تصبح عبر env
     timeout-minutes: 240
-
     env:
-      # تقليل المتطلبات وتفعيل ccache
+      # إعدادات الموارد لموازنة 16GB RAM
       ANDROID_BUILD_TOP: "/mnt/src"
       CCACHE_DIR: "/tmp/ccache"
       USE_CCACHE: "1"
-      # تقليل حجم الصور
-      ANDROID_COMPILE_BASE: "/opt/android"
-      # تعيين اسم المطور SPEEDFIRE
       BUILD_DISPLAY_ID: "SPEEDFIRE-ArrowOS-17-${{ github.run_number }}"
-      # تقليل Jobs بناءً على النوى المتاحة
-      BUILD_MAKE_JOBS: "${{ runner.cores }}"
-
+      # عدد النوى للاستخدام (ثابت للموارد المحدودة)
+      BUILD_MAKE_JOBS: "4"
+      # إعدادات Disk Space detection
+      TARGET_DISK_SPACE_GB: "150"
     steps:
-      # === الخطوة 1: إعداد البيئة بايقال الموارد ===
+      # === الخطوة 1: تحديد القسم الأكبر للمساحة ===
+      - name: Find Largest Available Disk
+        id: disk-check
+        run: |
+          # البحث عن الأقسام التي تزيد مساحتها عن 100GB
+          # ونحدد الأكبر للأبنية
+          echo "Checking disk spaces for build..."
+          # القائمة الممكنة لأقسام النظام
+          disk_list=()
+          # التحقق من الأقسام المتاحة
+          if [ -d "/mnt" ]; then
+            size_gb=$(df -BG /mnt | tail -1 | awk '{print $2}' | tr -d 'G')
+            echo "Found /mnt with size: ${size_gb}GB"
+            disk_list+=("/mnt")
+          fi
+          if [ -d "/data" ]; then
+            size_gb=$(df -BG /data | tail -1 | awk '{print $2}' | tr -d 'G')
+            echo "Found /data with size: ${size_gb}GB"
+            disk_list+=("/data")
+          fi
+          # إذا وجدت أقسام، نختار الأكبر
+          if [ ${#disk_list[@]} -gt 0 ]; then
+            largest=""
+            largest_size=0
+            for d in "${disk_list[@]}"; do
+              s=$(df -BG "$d" | tail -1 | awk '{print $2}' | tr -d 'G')
+              if [ "$s" -gt "$largest_size" ]; then
+                largest_size=$s
+                largest=$d
+              fi
+            done
+            echo "largest_disk=$largest" >> $GITHUB_OUTPUT
+            echo "Selected disk: $largest with ${largest_size}GB"
+          else
+            echo "largest_disk=/tmp" >> $GITHUB_OUTPUT
+            echo "Using /tmp as default disk"
+          fi
+
+      # === الخطوة 2: إعداد بيئة البناء ===
       - name: Setup Build Environment (Light)
         run: |
           sudo apt-get update -y
@@ -44,27 +75,28 @@ jobs:
             git gnupg flex bison gawk \
             build-essential zip curl \
             libncurses-dev xz-utils \
-            python3 distro || true
-          # إعداد ccache للمساحة والسرعة
+            python3 || true
+          # إعداد ccache مع حجم مناسب لـ 16GB RAM
           mkdir -p $CCACHE_DIR
           chmod -R 777 $CCACHE_DIR
+          ccache -M 2G
           echo "CCACHE_DIR=$CCACHE_DIR" >> $GITHUB_ENV
 
-      # === الخطوة 2: تحميل أداة repo ===
+      # === الخطوة 3: تحميل أداة repo ===
       - name: Install repo
         run: |
           curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod +x ~/repo
           export PATH="$HOME/repo:$PATH"
 
-      # === الخطوة 3: تهيئة مصدر ArrowOS ===
+      # === الخطوة 4: تهيئة مصدر ArrowOS ===
       - name: Initialize ArrowOS Source
         run: |
           mkdir -p arrow_gsi && cd arrow_gsi
           repo init -u https://github.com/ArrowOS-Arrow/arrow_manifest.git -b arrow-14.0 --depth=1
           mkdir -p .repo/local_manifests
 
-      # === الخطوة 4:同步 المصادر (Sync with limited depth) ===
+      # === الخطوة 5:同步 المصادر (Sync with limited depth) ===
       - name: Sync Sources (Optimized)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -72,7 +104,7 @@ jobs:
           cd arrow_gsi
           repo sync -c --no-clone-bundle --no-tags --optimized-fetches -j4
 
-      # === الخطوة 5: إضافة اسم المطور SPEEDFIRE ===
+      # === الخطوة 6: إضافة اسم المطور SPEEDFIRE ===
       - name: Add SPEEDFIRE Developer Credits
         run: |
           cd arrow_gsi
@@ -84,7 +116,7 @@ jobs:
           <project path="vendor/SPEEDFIRE" name="vendor_speedfire" remote="github" revision="main" />
           EOF
 
-      # === الخطوة 6: configuration للجهاز (إذا تم specifying) ===
+      # === الخطوة 7: configuration للجهاز (إذا تم specifying) ===
       - name: Configure Device (Optional)
         if: inputs.target_device != ''
         run: |
@@ -92,11 +124,12 @@ jobs:
           source build/envsetup.sh
           lunch "arrow_${{ inputs.target_device }}-userdebug" 2>/dev/null || echo "Device not found, building generic GSI"
 
-      # === الخطوة 7: بدء البناء بالموارد المحدودة ===
+      # === الخطوة 8: بدء البناء بالموارد المحدودة ===
       - name: Start GSI Build (Optimized)
         env:
           USE_CCACHE: "1"
           CCACHE_DIR: "/tmp/ccache"
+          BUILD_JOBS: "${{ env.BUILD_MAKE_JOBS }}"
         run: |
           cd arrow_gsi
           source build/envsetup.sh
@@ -110,14 +143,12 @@ jobs:
           fi
           
           # تفعيل ccache قبل البناء
-          prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-12.0.0-ccache
           export USE_CCACHE=1
           
-          # البناء المختصر - فقط system image
-          #削减 build targets to save memory
-          make -j${{ runner.cores }} systemimage 2>&1 | tail -50
+          # البناء المختصر - فقط system image مع تقليل النوى
+          make -j${{ env.BUILD_MAKE_JOBS }} systemimage 2>&1 | tail -50
 
-      # === الخطوة 8: رفع الملف الناتج ===
+      # === الخطوة 9: رفع الملف الناتج ===
       - name: Upload GSI Image
         if: always()
         uses: actions/upload-artifact@v4
@@ -126,7 +157,7 @@ jobs:
           path: arrow_gsi/out/target_product/*.img
           retention-days: 30
 
-      # === الخطوة 9: معلومات البناء ===
+      # === الخطوة 10: معلومات البناء ===
       - name: Build Summary
         if: always()
         run: |
@@ -137,4 +168,5 @@ jobs:
           echo "GSI Type: ArrowOS Generic System Image"
           echo "Developer: SPEEDFIRE (Custom Build)"
           echo "Resources: 16GB RAM optimized"
+          echo "Selected Disk: ${{ steps.disk-check.outputs.largest_disk }}"
           echo "========================================="
