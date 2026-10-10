@@ -1,0 +1,97 @@
+name: Build ArrowOS GSI Android 17 (GitHub Hosted - Lite)
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_build:
+        description: "Enable debug builds"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-gsi:
+    runs-on: ubuntu-latest  # ← مهم: يستخدم رانر GitHub السحابي (لا يحتاج Setup)
+    timeout-minutes: 120
+    env:
+      ANDROID_BUILD_TOP: "/mnt/src"
+      CCACHE_DIR: "/tmp/ccache"
+      USE_CCACHE: "1"
+      BUILD_DISPLAY_ID: "SPEEDFIRE-ArrowOS-17-${{ github.run_number }}"
+      # خفض Jobs للنواة المتاحة في الرنر
+      BUILD_MAKE_JOBS: "2"
+
+    steps:
+      # === الخطوة 1: التحقق من المساحة المتاحة ===
+      - name: Check Disk Space
+        run: |
+          df -h .
+          # عرض تحذير إذا كانت المساحة أقل من 20GB
+          space=$(df -BG . | tail -1 | awk '{print $2}' | tr -d 'G')
+          if [ "$space" -lt "20" ]; then
+            echo "⚠️ Disk space low: ${space}GB - build may fail"
+          fi
+
+      # === الخطوة 2: تحميل repo tool ===
+      - name: Install repo
+        run: |
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          chmod +x ~/repo
+          export PATH="$HOME/repo:$PATH"
+
+      # === الخطوة 3: تهيئة المصدر (عمق 1 لتوفير المساحة) ===
+      - name: Initialize ArrowOS
+        run: |
+          mkdir -p arrow_gsi && cd arrow_gsi
+          repo init -u https://github.com/ArrowOS-Arrow/arrow_manifest.git -b arrow-14.0 --depth=1
+          mkdir -p .repo/local_manifests
+
+      # === الخطوة 4:同步 المصادر (بسرعة وامتداد محدود) ===
+      - name: Sync Sources (Light)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd arrow_gsi
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetches -j2
+
+      # === الخطوة 5: إعدادات المطور SPEEDFIRE ===
+      - name: Add SPEEDFIRE Credits
+        run: |
+          cd arrow_gsi
+          echo 'PRODUCT_BUILD_PROP_OVERRIDES += BUILD_DISPLAY_ID=SPEEDFIRE-ArrowOS-17-userdebug' >> .repo/local_manifests/custom.xml
+          cat > .repo/local_manifests/SPEEDFIRE-credits.xml << 'EOF'
+          <!-- Developer: SPEEDFIRE -->
+          <project path="vendor/SPEEDFIRE" name="vendor_speedfire" remote="github" revision="main" />
+          EOF
+
+      # === الخطوة 6: البناء المختصر (بـ 2 نوى فقط) ===
+      - name: Build GSI (2 Jobs)
+        env:
+          USE_CCACHE: "1"
+          CCACHE_DIR: "/tmp/ccache"
+        run: |
+          cd arrow_gsi
+          source build/envsetup.sh
+          lunch arrow_arm64_bvN-android17-0-userdebug
+          # البناء بـ 2 نوى فقط وتخفيف الأحمال
+          make -j2 systemimage 2>&1 | tail -30
+
+      # === الخطوة 7: رفع الملف (إن وُجد) ===
+      - name: Upload GSI Image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arrowos-gsi-android17-hosted-${{ github.run_number }}
+          path: arrow_gsi/out/target_product/*.img
+          retention-days: 7
+
+      # === الخطوة 8: الملخص ===
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "Build Type: GitHub Hosted (Lite)"
+          echo "Ran on: ubuntu-latest runner"
+          echo "Developer: SPEEDFIRE"
+          echo "Resources: Limited (2 jobs, 20GB disk max)"
+          echo "========================================="
